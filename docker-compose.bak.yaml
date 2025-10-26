@@ -1,0 +1,148 @@
+networks:
+  logsnet:
+    driver: bridge
+
+volumes:
+  es_data: {}
+  os_data: {}
+  mongodb_data: {}
+  graylog_data: {}
+
+services:
+  ###########################################################################
+  # ELK STACK (Elasticsearch + Logstash + Kibana)
+  ###########################################################################
+  elasticsearch:
+    profiles: ["elk"]
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: elk-elasticsearch
+    environment:
+      - discovery.type=single-node
+      # За локално тестване без пароли:
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx2g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    networks: [logsnet]
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -E '\"status\":\"(yellow|green)\"'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  logstash:
+    profiles: ["elk"]
+    image: docker.elastic.co/logstash/logstash:8.14.0
+    container_name: elk-logstash
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks: [logsnet]
+    ports:
+      # Syslog UDP (не ползваме 514, за да избегнем привилегии) => 1514
+      - "1514:1514/udp"
+    volumes:
+      - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/_node/pipelines"]
+      interval: 10s
+      timeout: 2s
+      retries: 30
+
+  kibana:
+    profiles: ["elk"]
+    image: docker.elastic.co/kibana/kibana:8.14.0
+    container_name: elk-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks: [logsnet]
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5601/api/status"]
+      interval: 10s
+      timeout: 2s
+      retries: 30
+
+  ###########################################################################
+  # GRAYLOG STACK (OpenSearch + MongoDB + Graylog)
+  ###########################################################################
+  opensearch:
+    profiles: ["graylog"]
+    image: opensearchproject/opensearch:2.12.0
+    container_name: gl-opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks: [logsnet]
+    volumes:
+      - os_data:/usr/share/opensearch/data
+    ports:
+      - "9201:9200" # ако искаш да гледаш OS API локално
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9200/_cluster/health?wait_for_status=green&timeout=1s"]
+      interval: 10s
+      timeout: 2s
+      retries: 30
+
+  mongodb:
+    profiles: ["graylog"]
+    image: mongo:6
+    container_name: gl-mongodb
+    networks: [logsnet]
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  graylog:
+    profiles: ["graylog"]
+    image: graylog/graylog:5.2
+    container_name: graylog
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    networks: [logsnet]
+    environment:
+      # Минимални настройки за dev
+      GRAYLOG_PASSWORD_SECRET: "some-very-long-random-string-change-me"
+      GRAYLOG_ROOT_PASSWORD_SHA2: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918" # 'admin'
+      GRAYLOG_HTTP_EXTERNAL_URI: "http://localhost:9000/"
+      GRAYLOG_ELASTICSEARCH_HOSTS: "http://opensearch:9200"
+      GRAYLOG_MONGODB_URI: "mongodb://mongodb:27017/graylog"
+    volumes:
+      - graylog_data:/usr/share/graylog/data
+      # По избор: content packs (ако решиш да auto-create inputs)
+      # - ./graylog/contentpacks:/usr/share/graylog/data/contentpacks
+    ports:
+      - "9000:9000"        # Web UI
+      - "1514:1514/udp"    # Syslog UDP input (ще го създадеш от UI-то)
+      - "12201:12201/udp"  # GELF UDP input (ще го създадеш от UI-то)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/api/system/lbstatus"]
+      interval: 10s
+      timeout: 3s
+      retries: 60
